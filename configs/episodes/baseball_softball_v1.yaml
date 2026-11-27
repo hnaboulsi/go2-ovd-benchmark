@@ -1,0 +1,33 @@
+schema_version: "1.0"
+name: baseball_softball_v1
+seed: 20260918
+duration_s: 4.0
+capture_hz: 5.0
+initial_range_m: 1.5
+forward_velocity_mps: 0.15
+bearings_deg: [-30, 0, 30]
+conditions: [target, target_distractor, distractor_only, target_distractor_occluded]
+camera:
+  name: front_rgb
+  width_px: 640
+  height_px: 480
+  vertical_fov_deg: 70.0
+  # 0.36 m clears the upstream model's front collision sphere, which extends
+  # to roughly x=0.34 m. The originally proposed 0.30 m was visibly occluded
+  # by the robot model during camera validation.
+  body_position_m: [0.36, 0.0, 0.02]
+  downward_pitch_deg: 10.0
+objects:
+  target: baseball
+  distractor: softball
+  combined_lateral_offsets_m: [-0.12, 0.12]
+  minimum_visible_pixels: 25
+occlusion:
+  desired_visible_fraction: 0.65
+  tolerance: 0.05
+  geom_group: 4
+locomotion_limits:
+  minimum_base_height_m: 0.22
+  maximum_abs_roll_pitch_rad: 0.20
+  maximum_mpc_p95_ms: 20.8
+  maximum_control_p95_ms: 5.0

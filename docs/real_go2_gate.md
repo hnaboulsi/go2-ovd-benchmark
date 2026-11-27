@@ -1,0 +1,7 @@
+# Real Go2 gate
+
+Physical deployment is deliberately outside this milestone. It may begin only when the simulation matrix is repeatable; raw and filtered detections have been compared on identical frozen frames; actual camera intrinsics and extrinsics are measured; the onboard or companion inference target is chosen; authoritative joint position, velocity, torque, temperature, and current limits are obtained; command and state watchdogs are tested; changed ROS 2 messages are rebuilt and integration-tested; an OEM-supported safe stop is identified and tested without assuming zero torque is safe; and a physical emergency stop, human spotter, clear indoor area, speed limit, and written abort rules exist.
+
+The staged sequence is camera-only recording while stationary, offline detector replay with no control connection, approved supported-stand or restrained validation, slow straight motion no faster than 0.05 m/s over a short path, then small viewpoint changes while detections still cannot command motion. Abort immediately for stale state, stale detections, non-finite data, watchdog expiry, unexpected gait, loss of operator control, excessive body attitude, or any actuator/safety warning. Perception may influence a later high-level experiment only after these stages and must never bypass the locomotion safety layer.
+
+Passing the simulator, QP, camera, detector, or evaluator checks does not satisfy this gate.

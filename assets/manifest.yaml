@@ -1,0 +1,21 @@
+schema_version: "1.0"
+license: CC-BY-4.0
+source: https://ycb-benchmarks.s3.amazonaws.com/index.html
+objects:
+  softball:
+    ycb_id: 054_softball
+    url: https://ycb-benchmarks.s3.amazonaws.com/data/google/054_softball_google_16k.tgz
+    archive_sha256: c8d87659ebc2f6fa7111c455cceb0e8c918a50bd55d1a5201202d19493ce85cc
+    mesh_sha256: 53202bf47b68af01356e0795e32c8bd85d44e7853e55786f6b050c32c7e6c98a
+    mesh_path: 054_softball/google_16k/textured.obj
+    texture_path: 054_softball/google_16k/texture_map.png
+    expected_extent_m: [0.095370, 0.096174, 0.094591]
+  baseball:
+    ycb_id: 055_baseball
+    url: https://ycb-benchmarks.s3.amazonaws.com/data/google/055_baseball_google_16k.tgz
+    archive_sha256: 46d0fcd1b8b10622b0adde9fe4eb064dcd37dd236af87fc095dfaf1d85419bd7
+    mesh_sha256: f9b719a13329aafdd5cd9e42717a9420af0b8e0d609670e0132529d4210c8696
+    mesh_path: 055_baseball/google_16k/textured.obj
+    texture_path: 055_baseball/google_16k/texture_map.png
+    expected_extent_m: [0.073078, 0.073712, 0.072563]
+

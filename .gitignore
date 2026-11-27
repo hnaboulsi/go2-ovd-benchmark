@@ -1,0 +1,15 @@
+.DS_Store
+.cache/
+.deps/
+.tools/
+.envs/
+.venvs/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+runs/*
+!runs/.gitkeep
+reports/
+build/
+dist/

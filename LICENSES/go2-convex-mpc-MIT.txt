@@ -1,0 +1,4 @@
+The patched controller dependency is derived from
+https://github.com/elijah-waichong-chan/go2-convex-mpc at commit
+1c63c6a762779887ab0431fd60db681dede6cb32 and is licensed under the MIT
+License. The complete upstream license is retained in the cloned dependency.

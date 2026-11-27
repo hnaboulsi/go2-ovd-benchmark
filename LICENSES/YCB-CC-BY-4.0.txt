@@ -1,0 +1,11 @@
+The YCB Object and Model Set assets used by this project are distributed under
+Creative Commons Attribution 4.0 International (CC BY 4.0).
+
+Source: https://www.ycbbenchmarks.com/object-models/
+License: https://creativecommons.org/licenses/by/4.0/
+Citation: B. Calli et al., "Yale-CMU-Berkeley dataset for robotic manipulation
+research," The International Journal of Robotics Research, 2017.
+
+Downloaded objects:
+- 054_softball, Google 16K textured mesh
+- 055_baseball, Google 16K textured mesh

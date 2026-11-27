@@ -1,0 +1,15 @@
+name: go2-ovd-sim
+channels: [conda-forge]
+dependencies:
+  - python=3.10
+  - numpy=1.26.4
+  - scipy=1.15.2
+  - matplotlib=3.8.4
+  - mujoco=3.1.6
+  - pinocchio=3.1.0
+  - casadi=3.6.7
+  - pillow
+  - pyyaml
+  - pydantic>=2.7,<3
+  - pip
+

@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/elijah-waichong-chan/go2-convex-mpc.git",
+  "commit": "1c63c6a762779887ab0431fd60db681dede6cb32",
+  "patch": "controller/patches/simulation-hardening.patch",
+  "patch_sha256": "8b14f03e0a95d0a21e9699fc77b4629396fc906e63e07d860752cb3df413e364",
+  "scope": "Simulation-only finite-input, solver-status, torque-diagnostic hardening plus tests and a headless validator",
+  "excluded": ["ROS 2 changes", "demo GUI changes", "README edits", "local handoff documents"]
+}
+

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "go2-ovd-pipeline"
+version = "0.1.0"
+description = "Simulation-first open-vocabulary detection experiments for a walking Unitree Go2"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+  "numpy>=1.26,<3",
+  "Pillow>=10,<13",
+  "pydantic>=2.7,<3",
+  "PyYAML>=6,<7",
+]
+
+[project.optional-dependencies]
+report = ["matplotlib>=3.8,<4"]
+perception = [
+  "huggingface-hub>=1.31,<2",
+  "psutil>=6,<8",
+  "torch>=2.6",
+  "transformers>=5.17,<6",
+]
+
+[project.scripts]
+go2-ovd = "go2_ovd.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

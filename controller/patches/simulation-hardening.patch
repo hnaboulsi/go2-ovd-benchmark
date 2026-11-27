@@ -1,0 +1,1127 @@
+From ec173b987e6a527214eb1ea3d728228ae12445ec Mon Sep 17 00:00:00 2001
+From: Go2 OVD Pipeline <local@example.invalid>
+Date: Tue, 15 Sep 2026 23:37:12 -0700
+Subject: [PATCH] Add verified simulation safety checks and validator
+
+---
+ examples/validate_mpc.py         | 368 +++++++++++++++++++++++++++++++
+ src/convex_mpc/centroidal_mpc.py | 155 ++++++++++++-
+ src/convex_mpc/com_trajectory.py |  31 ++-
+ src/convex_mpc/gait.py           |  31 ++-
+ src/convex_mpc/go2_robot_data.py |   7 +-
+ src/convex_mpc/leg_controller.py |  26 ++-
+ src/convex_mpc/safety_checks.py  |  32 +++
+ tests/test_mpc_formulation.py    | 130 +++++++++++
+ tests/test_safety_hardening.py   |  79 +++++++
+ 9 files changed, 829 insertions(+), 30 deletions(-)
+ create mode 100644 examples/validate_mpc.py
+ create mode 100644 src/convex_mpc/safety_checks.py
+ create mode 100644 tests/test_mpc_formulation.py
+ create mode 100644 tests/test_safety_hardening.py
+
+diff --git a/examples/validate_mpc.py b/examples/validate_mpc.py
+new file mode 100644
+index 0000000..5c50a53
+--- /dev/null
++++ b/examples/validate_mpc.py
+@@ -0,0 +1,368 @@
++"""Deterministic headless validation for the Go2 convex MPC control path."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import time
++from pathlib import Path
++
++import matplotlib
++import mujoco as mj
++import numpy as np
++from convex_mpc.safety_checks import clip_torque, saturation_metrics
++
++matplotlib.use("Agg")
++import matplotlib.pyplot as plt
++
++from convex_mpc.centroidal_mpc import MU, RAW_SWING_FORCE_TOL, CentroidalMPC
++from convex_mpc.com_trajectory import ComTraj
++from convex_mpc.gait import Gait, LEG_ORDER
++from convex_mpc.go2_robot_data import PinGo2Model
++from convex_mpc.leg_controller import LegController
++from convex_mpc.mujoco_model import MuJoCo_GO2_Model
++
++
++SIM_HZ = 1000
++CTRL_HZ = 200
++SIM_DT = 1.0 / SIM_HZ
++CTRL_DT = 1.0 / CTRL_HZ
++CTRL_DECIM = SIM_HZ // CTRL_HZ
++RUN_LENGTH_S = 8.0
++
++GAIT_HZ = 3.0
++GAIT_DUTY = 0.6
++MPC_DT = (1.0 / GAIT_HZ) / 16.0
++MPC_HZ = 1.0 / MPC_DT
++STEPS_PER_MPC = max(1, int(CTRL_HZ // MPC_HZ))
++
++TAU_LIM = 0.9 * np.array(
++    [23.7, 23.7, 45.43] * 4, dtype=float
++)
++LEG_SLICE = {leg: slice(3 * i, 3 * i + 3) for i, leg in enumerate(LEG_ORDER)}
++
++
++def command_at(t: float):
++    """Return body-frame ``vx, vy, z, yaw_rate`` and a stage label."""
++    if t < 1.0:
++        return 0.0, 0.0, 0.27, 0.0, "height_hold"
++    if t < 3.0:
++        return 0.0, 0.0, 0.27, 0.0, "trot_in_place"
++    if t < 6.0:
++        return 0.3, 0.0, 0.27, 0.0, "slow_forward"
++    return 0.0, 0.0, 0.27, 0.0, "stop"
++
++
++def _constraint_metrics(raw_u: np.ndarray, contact: np.ndarray):
++    forces = raw_u.reshape(4, 3, raw_u.shape[1])
++    force_by_step = forces.transpose(2, 0, 1)
++    swing_abs = np.abs(force_by_step[~contact.T])
++    stance = force_by_step[contact.T]
++    raw_swing_max = float(np.max(swing_abs)) if swing_abs.size else 0.0
++    if stance.size:
++        stance_min_fz = float(np.min(stance[:, 2]))
++        friction_violation = float(
++            np.max(
++                np.maximum(
++                    np.abs(stance[:, :2]) - MU * stance[:, 2, None],
++                    0.0,
++                )
++            )
++        )
++    else:
++        stance_min_fz = 0.0
++        friction_violation = 0.0
++    return raw_swing_max, stance_min_fz, friction_violation
++
++
++def _save_plots(output_dir: Path, log: dict):
++    t = log["time"]
++    actual = log["actual_state"]
++    desired = log["desired_state"]
++    contact = log["contact"]
++    raw = log["raw_grf"]
++    applied = log["applied_grf"]
++
++    fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
++    labels = ((0, 3, "position (m)"), (6, 9, "linear velocity (m/s)"),
++              (3, 6, "roll/pitch/yaw (rad)"), (9, 12, "angular velocity (rad/s)"))
++    xyz = ("x", "y", "z")
++    for axis, (start, end, ylabel) in zip(axes, labels):
++        for component, name in enumerate(xyz):
++            axis.plot(t, actual[:, start + component], label=f"actual {name}")
++            axis.plot(t, desired[:, start + component], "--", label=f"desired {name}")
++        axis.set_ylabel(ylabel)
++        axis.grid(True)
++        axis.legend(ncol=3, fontsize=8)
++    axes[-1].set_xlabel("time (s)")
++    fig.tight_layout()
++    fig.savefig(output_dir / "state_tracking.png", dpi=160)
++    plt.close(fig)
++
++    fig, axes = plt.subplots(4, 1, figsize=(12, 11), sharex=True)
++    for leg, axis in enumerate(axes):
++        for component, name in enumerate(xyz):
++            column = 3 * leg + component
++            axis.plot(t, raw[:, column], ":", alpha=0.75, label=f"raw {name}")
++            axis.plot(t, applied[:, column], label=f"applied {name}")
++        axis.step(t, 20.0 * contact[:, leg], where="post", color="black", alpha=0.4,
++                  label="contact x20")
++        axis.set_ylabel(f"{LEG_ORDER[leg]} force (N)")
++        axis.grid(True)
++        axis.legend(ncol=4, fontsize=8)
++    axes[-1].set_xlabel("time (s)")
++    fig.tight_layout()
++    fig.savefig(output_dir / "contact_forces.png", dpi=160)
++    plt.close(fig)
++
++    fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
++    torque = log["joint_torque"]
++    for leg, axis in enumerate(axes):
++        for component, name in enumerate(("hip", "thigh", "calf")):
++            axis.plot(t, log["joint_torque_demand"][:, 3 * leg + component], ":", alpha=.65, label=f"{name} demand")
++            axis.plot(t, torque[:, 3 * leg + component], label=f"{name} clipped")
++        axis.set_ylabel(f"{LEG_ORDER[leg]} torque (Nm)")
++        axis.grid(True)
++        axis.legend(ncol=3, fontsize=8)
++    axes[-1].set_xlabel("time (s)")
++    fig.tight_layout()
++    fig.savefig(output_dir / "joint_torques.png", dpi=160)
++    plt.close(fig)
++
++    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=False)
++    axes[0].plot(log["mpc_time"], log["mpc_update_ms"], label="QP update")
++    axes[0].plot(log["mpc_time"], log["mpc_solve_ms"], label="QP solve")
++    axes[0].axhline(MPC_DT * 1e3, color="red", linestyle="--", label="20.8 ms budget")
++    axes[0].set_ylabel("MPC latency (ms)")
++    axes[0].legend()
++    axes[0].grid(True)
++    axes[1].plot(t, log["control_tick_ms"], label="200 Hz control tick")
++    axes[1].axhline(CTRL_DT * 1e3, color="red", linestyle="--", label="5 ms deadline")
++    axes[1].set_xlabel("time (s)")
++    axes[1].set_ylabel("control latency (ms)")
++    axes[1].legend()
++    axes[1].grid(True)
++    fig.tight_layout()
++    fig.savefig(output_dir / "timing.png", dpi=160)
++    plt.close(fig)
++
++
++def run_validation(output_dir: Path, replay: bool = False):
++    if SIM_HZ % CTRL_HZ != 0:
++        raise ValueError("simulation rate must be divisible by control rate")
++    output_dir.mkdir(parents=True, exist_ok=True)
++
++    go2 = PinGo2Model()
++    sim = MuJoCo_GO2_Model()
++    gait = Gait(GAIT_HZ, GAIT_DUTY)
++    traj = ComTraj(go2)
++    leg_controller = LegController()
++
++    q_init = go2.current_config.get_q()
++    q_init[0] = -5.0
++    sim.update_with_q_pin(q_init)
++    sim.model.opt.timestep = SIM_DT
++    traj.generate_traj(go2, gait, 0.0, 0.0, 0.0, 0.27, 0.0, MPC_DT)
++    mpc = CentroidalMPC(go2, traj)
++
++    control_steps = int(RUN_LENGTH_S * CTRL_HZ)
++    sim_steps = int(RUN_LENGTH_S * SIM_HZ)
++    log = {
++        "time": np.zeros(control_steps),
++        "actual_state": np.zeros((control_steps, 12)),
++        "desired_state": np.zeros((control_steps, 12)),
++        "contact": np.zeros((control_steps, 4), dtype=np.int32),
++        "raw_grf": np.zeros((control_steps, 12)),
++        "applied_grf": np.zeros((control_steps, 12)),
++        "joint_torque": np.zeros((control_steps, 12)),
++        "joint_torque_demand": np.zeros((control_steps, 12)),
++        "torque_clipping": np.zeros((control_steps, 12)),
++        "control_tick_ms": np.zeros(control_steps),
++        "stage": np.empty(control_steps, dtype=object),
++        "mpc_time": [],
++        "mpc_update_ms": [],
++        "mpc_solve_ms": [],
++        "solver_status": [],
++    }
++    render_time, render_q, render_tau = [], [], []
++    next_render_t = 0.0
++    render_dt = 1.0 / 120.0
++
++    ctrl_i = 0
++    tau_hold = np.zeros(12)
++    U_raw = np.zeros((12, traj.N))
++    last_contact = None
++    max_raw_swing = 0.0
++    min_stance_fz = np.inf
++    max_friction_violation = 0.0
++
++    for sim_i in range(sim_steps):
++        now = float(sim.data.time)
++        if sim_i % CTRL_DECIM == 0:
++            tick_start = time.perf_counter()
++            vx, vy, z_ref, yaw_rate, stage = command_at(now)
++            sim.update_pin_with_mujoco(go2)
++            actual = go2.compute_com_x_vec().reshape(12)
++            current_contact = gait.compute_current_mask(now)
++            transition = last_contact is None or not np.array_equal(current_contact, last_contact)
++
++            if ctrl_i % STEPS_PER_MPC == 0 or transition:
++                traj.generate_traj(go2, gait, now, vx, vy, z_ref, yaw_rate, MPC_DT)
++                solution = mpc.solve_QP(go2, traj)
++                _, U_raw = mpc.extract_solution(solution, traj, current_contact)
++                raw_swing, stance_fz, friction = _constraint_metrics(
++                    U_raw, traj.contact_table.astype(bool)
++                )
++                max_raw_swing = max(max_raw_swing, raw_swing)
++                min_stance_fz = min(min_stance_fz, stance_fz)
++                max_friction_violation = max(max_friction_violation, friction)
++                log["mpc_time"].append(now)
++                log["mpc_update_ms"].append(mpc.update_time)
++                log["mpc_solve_ms"].append(mpc.solve_time)
++                log["solver_status"].append(str(mpc.last_status))
++
++            raw_first = U_raw[:, 0].copy()
++            applied = mpc.apply_contact_mask(raw_first, current_contact)
++            desired = np.concatenate(
++                [traj.pos_traj_world[:, 0], traj.rpy_traj_world[:, 0],
++                 traj.vel_traj_world[:, 0], traj.omega_traj_world[:, 0]]
++            )
++
++            tau_raw = np.zeros(12)
++            for leg in LEG_ORDER:
++                sl = LEG_SLICE[leg]
++                result = leg_controller.compute_leg_torque(
++                    leg, go2, gait, applied[sl], now, contact_mask=current_contact
++                )
++                tau_raw[sl] = result.tau
++            tau_hold = clip_torque(tau_raw, TAU_LIM)
++
++            log["time"][ctrl_i] = now
++            log["actual_state"][ctrl_i] = actual
++            log["desired_state"][ctrl_i] = desired
++            log["contact"][ctrl_i] = current_contact
++            log["raw_grf"][ctrl_i] = raw_first
++            log["applied_grf"][ctrl_i] = applied
++            log["joint_torque_demand"][ctrl_i] = tau_raw
++            log["torque_clipping"][ctrl_i] = np.abs(tau_raw - tau_hold)
++            log["joint_torque"][ctrl_i] = tau_hold
++            log["stage"][ctrl_i] = stage
++            last_contact = current_contact.copy()
++            ctrl_i += 1
++
++        mj.mj_step1(sim.model, sim.data)
++        sim.set_joint_torque(tau_hold)
++        mj.mj_step2(sim.model, sim.data)
++        after = float(sim.data.time)
++        if after + 1e-12 >= next_render_t:
++            render_time.append(after)
++            render_q.append(sim.data.qpos.copy())
++            render_tau.append(tau_hold.copy())
++            next_render_t += render_dt
++        # Full control interval workload: sensing through all five physics/
++        # actuator substeps and logging. No pacing sleep or hardware transport.
++        if (sim_i + 1) % CTRL_DECIM == 0:
++            log["control_tick_ms"][ctrl_i - 1] = (time.perf_counter() - tick_start) * 1e3
++
++    for key in ("time", "actual_state", "desired_state", "contact", "raw_grf",
++                "applied_grf", "joint_torque", "joint_torque_demand", "torque_clipping", "control_tick_ms", "stage"):
++        log[key] = log[key][:ctrl_i]
++    for key in ("mpc_time", "mpc_update_ms", "mpc_solve_ms"):
++        log[key] = np.asarray(log[key], dtype=float)
++
++    t = log["time"]
++    actual = log["actual_state"]
++    applied_legs = log["applied_grf"].reshape(-1, 4, 3)
++    swing = ~log["contact"].astype(bool)
++    applied_swing = np.abs(applied_legs[swing])
++    applied_swing_max = float(np.max(applied_swing)) if applied_swing.size else 0.0
++    vertical = np.sum(log["applied_grf"][:, [2, 5, 8, 11]], axis=1)
++    weight = float(go2.data.Ig.mass) * 9.81
++    support_window = (t >= 1.0) & (t < 3.0)
++    forward_window = (t >= 3.5) & (t < 6.0)
++    stop_window = t >= 7.5
++    support_ratio = float(np.mean(vertical[support_window]) / weight)
++    forward_vx = float(np.mean(actual[forward_window, 6]))
++    forward_dx = float(actual[t < 6.0][-1, 0] - actual[t >= 3.0][0, 0])
++    stop_speed = float(np.mean(np.linalg.norm(actual[stop_window, 6:8], axis=1)))
++    mpc_total = log["mpc_update_ms"] + log["mpc_solve_ms"]
++    overrun_idx = np.flatnonzero(log["control_tick_ms"] > CTRL_DT * 1e3)
++
++    checks = {
++        "all_qp_solved": bool(log["solver_status"] and set(log["solver_status"]) == {"solved"}),
++        "raw_swing_within_solver_tolerance": max_raw_swing <= RAW_SWING_FORCE_TOL,
++        "applied_swing_exact_zero": applied_swing_max == 0.0,
++        "stance_normal_force_nonnegative": min_stance_fz >= -2e-2,
++        "friction_pyramid_satisfied": max_friction_violation <= 2e-2,
++        "joint_torque_limits_satisfied": bool(
++            np.all(np.abs(log["joint_torque"]) <= TAU_LIM[None, :] + 1e-12)
++        ),
++        "vertical_support_consistent": 0.75 <= support_ratio <= 1.25,
++        "height_in_range": bool(np.min(actual[:, 2]) >= 0.22 and np.max(actual[:, 2]) <= 0.32),
++        "upright": bool(np.max(np.abs(actual[:, 3:5])) <= 0.20),
++        "forward_command_tracks_positive": forward_vx > 0.15 and forward_dx > 0.0,
++        "stops_after_command": stop_speed < 0.15,
++        "mpc_p95_within_budget": float(np.percentile(mpc_total, 95)) < MPC_DT * 1e3,
++    }
++    metrics = {
++        "torque_saturation": saturation_metrics(log["joint_torque_demand"], log["joint_torque"]),
++        "control_timing_scope": "sensing through all physics/actuator substeps and logging; excludes pacing sleep; no hardware transport",
++        "control_ticks": ctrl_i,
++        "mpc_solves": len(log["solver_status"]),
++        "solver_status_counts": {
++            status: log["solver_status"].count(status) for status in sorted(set(log["solver_status"]))
++        },
++        "robot_mass_kg": float(go2.data.Ig.mass),
++        "weight_n": weight,
++        "raw_swing_force_max_abs_n": max_raw_swing,
++        "applied_swing_force_max_abs_n": applied_swing_max,
++        "stance_normal_force_min_n": float(min_stance_fz),
++        "friction_pyramid_max_violation_n": max_friction_violation,
++        "vertical_support_ratio": support_ratio,
++        "height_min_m": float(np.min(actual[:, 2])),
++        "height_max_m": float(np.max(actual[:, 2])),
++        "max_abs_roll_rad": float(np.max(np.abs(actual[:, 3]))),
++        "max_abs_pitch_rad": float(np.max(np.abs(actual[:, 4]))),
++        "forward_mean_vx_mps": forward_vx,
++        "forward_displacement_m": forward_dx,
++        "stopped_mean_planar_speed_mps": stop_speed,
++        "mpc_total_p95_ms": float(np.percentile(mpc_total, 95)),
++        "mpc_total_max_ms": float(np.max(mpc_total)),
++        "control_tick_p95_ms": float(np.percentile(log["control_tick_ms"], 95)),
++        "control_tick_max_ms": float(np.max(log["control_tick_ms"])),
++        "control_deadline_overrun_count": int(overrun_idx.size),
++        "control_deadline_overrun_times_s": [float(t[i]) for i in overrun_idx],
++    }
++    report = {"passed": bool(all(checks.values())), "checks": checks, "metrics": metrics}
++    (output_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n")
++    np.savez_compressed(
++        output_dir / "control_log.npz",
++        **{
++            key: (value.astype(str) if key == "stage" else value)
++            for key, value in log.items() if key != "solver_status"
++        },
++        solver_status=np.asarray(log["solver_status"], dtype=str),
++    )
++    _save_plots(output_dir, log)
++
++    print(json.dumps(report, indent=2))
++    print(f"Saved validation artifacts to {output_dir}")
++    if replay:
++        sim.replay_simulation(
++            np.asarray(render_time), np.asarray(render_q), np.asarray(render_tau), render_dt, 1.0
++        )
++    if not report["passed"]:
++        raise SystemExit(1)
++    return report
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--output-dir", type=Path, default=Path("work/validation_output"))
++    parser.add_argument("--replay", action="store_true", help="Replay the validated run in MuJoCo")
++    args = parser.parse_args()
++    run_validation(args.output_dir, replay=args.replay)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/convex_mpc/centroidal_mpc.py b/src/convex_mpc/centroidal_mpc.py
+index 52892fb..4a5b567 100644
+--- a/src/convex_mpc/centroidal_mpc.py
++++ b/src/convex_mpc/centroidal_mpc.py
+@@ -4,6 +4,7 @@ import scipy.sparse as sp
+ from .com_trajectory import ComTraj
+ from .go2_robot_data import PinGo2Model
+ import time
++from .safety_checks import binary_contacts
+ 
+ # --------------------------------------------------------------------------------
+ # Model Predictive Control Setting
+@@ -15,6 +16,12 @@ COST_MATRIX_R = np.diag([1e-5] * 12)                                    # Input
+ MU = 0.8    # Friction coefficient
+ NX = 12     # State size (6-DOF 12 states)
+ NU = 12     # Input size (4 x 3D force)
++FZ_MIN = 10.0
++# OSQP uses scaled termination in this controller. A 0.01 N unscaled force
++# residual is a conservative diagnostic ceiling while remaining negligible for
++# actuation; the separate applied-force mask is still exact.
++RAW_SWING_FORCE_TOL = 1e-2
++LEG_ORDER = ("FL", "FR", "RL", "RR")
+ 
+ # Solver Option
+ OPTS = {
+@@ -42,8 +49,11 @@ class CentroidalMPC:
+         self.Q = COST_MATRIX_Q 
+         self.R = COST_MATRIX_R 
+         self.nvars = traj.N * NX + traj.N * NU    # Total number of decision variables                          
+-        self.solve_time: float = 0 
++        self.solve_time: float = 0
++        self.update_time: float = 0
++        self._last_solver_stats = None
+         self.N = traj.N
++        self._validate_trajectory(traj)
+ 
+         # Below we compute the constant elements of the MPC controller
+         # This heavily reduces the time needed for update between each iteration
+@@ -68,8 +78,13 @@ class CentroidalMPC:
+ 
+     def solve_QP(self, go2:PinGo2Model, traj: ComTraj, verbose: bool = False):
+         """
+-        # This method is called in every MPC iteration
++        Solve one receding-horizon QP and retain its status for diagnostics.
++
++        The return value remains CasADi's solution dictionary for compatibility.
++        A failed or non-finite solution is never accepted as a warm start.
+         """
++        del go2  # Dynamics/state are already captured in ``traj``.
++        self._validate_trajectory(traj)
+         t0 = time.perf_counter()
+ 
+         # 1) Update the QP (time-varying elements including reference trajectory, contact table, dynamics)
+@@ -95,7 +110,13 @@ class CentroidalMPC:
+             qp_args['lam_a0'] = self.lam_a_prev    # Dual guess (linear constraints)
+ 
+         # 4) Solve the QP
+-        sol = self.solver(**qp_args)
++        try:
++            sol = self.solver(**qp_args)
++        except RuntimeError as exc:
++            stats = dict(self.solver.stats())
++            self._last_solver_stats = stats
++            status = stats.get("return_status", "exception")
++            raise RuntimeError(f"MPC QP failed with status '{status}': {exc}") from exc
+         t2 = time.perf_counter()
+ 
+         # 5) Document time spent
+@@ -104,27 +125,132 @@ class CentroidalMPC:
+         self.update_time = t_compute * 1e3
+         self.solve_time = t_solve * 1e3
+ 
+-        # 6) Save the solution for warm start next time
++        # 6) Validate before accepting this solution as the next warm start.
++        stats = dict(self.solver.stats())
++        self._last_solver_stats = stats
++        self._validate_solution(sol, stats)
++
++        # 7) Save the solution for warm start next time
+         self.x_prev = sol["x"]              # Warm start primal
+         self.lam_x_prev = sol["lam_x"]      # Warm start dual (bounds)
+         self.lam_a_prev = sol["lam_a"]      # Warm start dual (constraints)
+ 
+-        # 7) Print Summary
+-        stats = self.solver.stats()
++        # 8) Print Summary
+         if verbose:
+-            stats = self.solver.stats()
+             print(f"[QP SOLVER] update matrix takes {t_compute*1e3:.3f} ms")
+             print(f"[QP SOLVER] solver takes {t_solve*1e3:.3f} ms")
+             print(f"[QP SOLVER] total time = {(t_compute + t_solve)*1e3:.3f} ms  ({1.0/(t_compute + t_solve):.1f} Hz)")
+             print(f"[QP SOLVER] status: {stats.get('return_status')}")
+         return sol
+ 
++    @property
++    def last_solver_stats(self):
++        """Return a copy of the most recent CasADi/OSQP statistics."""
++        return None if self._last_solver_stats is None else dict(self._last_solver_stats)
++
++    @property
++    def last_status(self):
++        if self._last_solver_stats is None:
++            return None
++        return self._last_solver_stats.get("return_status")
++
++    def extract_solution(self, sol, traj: ComTraj, current_contact_mask=None):
++        """Return checked ``X[NX,N]`` and ``U[NU,N]`` arrays.
++
++        State ordering is ``[p_W, rpy_W, v_W, omega_W]``. Force ordering at
++        each horizon step is ``[FL_W, FR_W, RL_W, RR_W]`` with three XYZ
++        components per foot. ``U`` is the raw optimizer result and is never
++        masked, preserving numerical residuals for solver diagnostics.
++        """
++        self._validate_trajectory(traj)
++        decision = np.asarray(sol["x"].full(), dtype=float).reshape(-1)
++        if decision.shape != (self.nvars,):
++            raise ValueError(
++                f"QP solution must have shape ({self.nvars},), got {decision.shape}"
++            )
++        if not np.all(np.isfinite(decision)):
++            raise RuntimeError("MPC QP returned a non-finite decision vector")
++
++        state_size = self.N * NX
++        X_opt = decision[:state_size].reshape((NX, self.N), order="F")
++        U_opt = decision[state_size:].reshape((NU, self.N), order="F")
++        contact = binary_contacts(traj.contact_table, (4, self.N))
++        contact_xyz = np.repeat(contact, 3, axis=0)
++        raw_swing = np.abs(U_opt[~contact_xyz])
++        if raw_swing.size and float(np.max(raw_swing)) > RAW_SWING_FORCE_TOL:
++            raise RuntimeError(
++                "raw MPC swing force exceeds solver tolerance: "
++                f"{float(np.max(raw_swing)):.6g} N > {RAW_SWING_FORCE_TOL:.6g} N"
++            )
++
++        if current_contact_mask is not None:
++            current = binary_contacts(current_contact_mask, (4,))
++            if current.shape != (len(LEG_ORDER),):
++                raise ValueError(
++                    f"current contact mask must have shape (4,), got {current.shape}"
++                )
++            if not np.array_equal(current, contact[:, 0]):
++                raise RuntimeError(
++                    "MPC first-step contact schedule does not match the current leg-controller mask"
++                )
++
++        return X_opt, U_opt
++
++    @staticmethod
++    def apply_contact_mask(raw_first_force, current_contact_mask):
++        """Mask a raw first-step GRF for actuation without altering diagnostics."""
++        raw = np.asarray(raw_first_force, dtype=float).reshape(-1)
++        contact = binary_contacts(current_contact_mask, (4,))
++        if raw.shape != (NU,):
++            raise ValueError(f"raw first force must have shape ({NU},), got {raw.shape}")
++        if contact.shape != (len(LEG_ORDER),):
++            raise ValueError(f"contact mask must have shape (4,), got {contact.shape}")
++        if not np.all(np.isfinite(raw)):
++            raise ValueError("raw first force contains non-finite values")
++        applied = raw.copy()
++        applied[~np.repeat(contact, 3)] = 0.0
++        return applied
++
++    def _validate_trajectory(self, traj: ComTraj):
++        expected = {
++            "initial_x_vec": (NX, 1),
++            "contact_table": (len(LEG_ORDER), self.N),
++            "Ad": (NX, NX),
++            "Bd": (self.N, NX, NU),
++            "gd": (NX, 1),
++        }
++        for name, shape in expected.items():
++            value = np.asarray(getattr(traj, name))
++            if value.shape != shape:
++                raise ValueError(f"traj.{name} must have shape {shape}, got {value.shape}")
++            if not np.all(np.isfinite(value)):
++                raise ValueError(f"traj.{name} contains non-finite values")
++        reference = np.asarray(traj.compute_x_ref_vec())
++        if not np.all(np.isfinite(reference)):
++            raise ValueError("reference trajectory contains non-finite values")
++        binary_contacts(traj.contact_table, (4, self.N))
++        if reference.shape != (NX, self.N):
++            raise ValueError(
++                f"reference trajectory must have shape {(NX, self.N)}, got {reference.shape}"
++            )
++        if traj.N != self.N:
++            raise ValueError(f"MPC horizon is fixed at {self.N}, got traj.N={traj.N}")
++
++    def _validate_solution(self, sol, stats):
++        status = stats.get("return_status", "unknown")
++        if not bool(stats.get("success", False)):
++            raise RuntimeError(f"MPC QP failed with status '{status}'")
++        decision = np.asarray(sol["x"].full(), dtype=float).reshape(-1)
++        if decision.shape != (self.nvars,) or not np.all(np.isfinite(decision)):
++            raise RuntimeError(
++                f"MPC QP returned an invalid decision vector with status '{status}'"
++            )
++
+     def _compute_bounds(self, traj: ComTraj):
+         """
+         This method returns box constriant bounds
+         """
+ 
+-        fz_min = 10     # Prevent slipping
+         N = traj.N      
+         nvars = self.nvars
+         start_u = N*12
+@@ -139,7 +265,9 @@ class CentroidalMPC:
+         force_idx   = start_u + force_block                                # (12, N)
+ 
+         # 3) Contact mask
+-        contact = np.asarray(traj.contact_table, dtype=bool)  # (4, N); True=stance, False=swing
++        contact = binary_contacts(traj.contact_table, (4, N))
++        if contact.shape != (len(LEG_ORDER), N):
++            raise ValueError(f"contact table must have shape (4, {N}), got {contact.shape}")
+ 
+         # Indices for each leg's (x,y,z) rows within the 12 rows
+         leg_rows = np.array([[0, 1, 2],
+@@ -167,7 +295,7 @@ class CentroidalMPC:
+         stance_idx    = stance_idx_2d[stance_mask]
+ 
+         # keep the tighter lower bound if any
+-        lbx_np[stance_idx, 0] = np.maximum(lbx_np[stance_idx, 0], fz_min)
++        lbx_np[stance_idx, 0] = np.maximum(lbx_np[stance_idx, 0], FZ_MIN)
+ 
+         # 6) Convert to CasADi
+         lbx = ca.DM(lbx_np)
+@@ -207,6 +335,11 @@ class CentroidalMPC:
+         
+         A_init = self._assemble_A_matrix(Ad_dm, Bd_seq_dm)
+         self.A_sp = A_init.sparsity()
++        expected_constraints = self.N * NX + self.N * len(LEG_ORDER) * 4
++        if self.H_const.size() != (self.nvars, self.nvars):
++            raise ValueError(f"unexpected Hessian shape {self.H_const.size()}")
++        if A_init.size() != (expected_constraints, self.nvars):
++            raise ValueError(f"unexpected constraint matrix shape {A_init.size()}")
+ 
+         # 3) Create Solver
+         qp = {'h': self.H_sp, 'a': self.A_sp}
+@@ -361,4 +494,4 @@ class CentroidalMPC:
+     @staticmethod
+     def _scipy_to_casadi(M):
+         M = M.tocsc()
+-        return ca.DM(ca.Sparsity(M.shape[0], M.shape[1], M.indptr, M.indices), M.data)
+\ No newline at end of file
++        return ca.DM(ca.Sparsity(M.shape[0], M.shape[1], M.indptr, M.indices), M.data)
+diff --git a/src/convex_mpc/com_trajectory.py b/src/convex_mpc/com_trajectory.py
+index ea6fd8a..14c42f0 100644
+--- a/src/convex_mpc/com_trajectory.py
++++ b/src/convex_mpc/com_trajectory.py
+@@ -1,4 +1,5 @@
+ import numpy as np
++from .safety_checks import binary_contacts
+ from .go2_robot_data import PinGo2Model
+ from .gait import Gait
+ from numpy import cos, sin
+@@ -13,6 +14,7 @@ class ComTraj:
+         self.pos_des_world = x_vec[0:3]
+ 
+     def compute_x_ref_vec(self):
++        """Return ``[p_W, rpy_W, v_W, omega_W]`` references as ``(12, N)``."""
+         refs = [
+             self.pos_traj_world,
+             self.rpy_traj_world,
+@@ -209,6 +211,29 @@ class ComTraj:
+         # Update the traj dynamics
+         self._continuousDynamics(go2)
+         self._discreteDynamics(time_step)
++        self._validate_generated_trajectory()
++
++    def _validate_generated_trajectory(self):
++        binary_contacts(self.contact_table, (4, self.N))
++        expected = {
++            "initial_x_vec": (12, 1),
++            "pos_traj_world": (3, self.N),
++            "rpy_traj_world": (3, self.N),
++            "vel_traj_world": (3, self.N),
++            "omega_traj_world": (3, self.N),
++            "contact_table": (4, self.N),
++            "Ad": (12, 12),
++            "Bd": (self.N, 12, 12),
++            "gd": (12, 1),
++        }
++        for name, shape in expected.items():
++            value = np.asarray(getattr(self, name))
++            if value.shape != shape:
++                raise ValueError(f"{name} must have shape {shape}, got {value.shape}")
++            if not np.all(np.isfinite(value)):
++                raise ValueError(f"{name} contains non-finite values")
++        if self.m <= 0.0:
++            raise ValueError(f"robot mass must be positive, got {self.m}")
+ 
+     def _skew(self,vector):
+ 
+@@ -261,7 +286,7 @@ class ComTraj:
+                 [I_inv @ skew_r1,   I_inv @ skew_r2,   I_inv @ skew_r3,   I_inv @ skew_r4],
+             ])
+ 
+-        # Gravity Vector
++        # Gravity in world coordinates: world +z is up, so free-fall is -9.81 m/s^2.
+         self.gc = np.array([
+             0, 0, 0, 
+             0, 0, 0, 
+@@ -287,7 +312,7 @@ class ComTraj:
+         Ad[3:6, 9:12] = dt * RzT             # rpy <- omega (approx)
+         self.Ad = Ad
+ 
+-        # ---- gd ---- (gravity only affects position/velocity)
++        # ---- gd ---- (world-frame gravity only affects position/velocity)
+         g = np.array([0.0, 0.0, -9.81], dtype=float)
+         gd = np.zeros((12, 1), dtype=float)
+         gd[0:3, 0] = 0.5 * g * dt * dt       # p += 1/2 g dt^2
+@@ -337,4 +362,4 @@ class ComTraj:
+             Bi[3:6, 6:9]   = 0.5 * dt * dt * (RzT @ W3)
+             Bi[3:6, 9:12]  = 0.5 * dt * dt * (RzT @ W4)
+ 
+-        self.Bd = Bd
+\ No newline at end of file
++        self.Bd = Bd
+diff --git a/src/convex_mpc/gait.py b/src/convex_mpc/gait.py
+index 334c52e..f48620e 100644
+--- a/src/convex_mpc/gait.py
++++ b/src/convex_mpc/gait.py
+@@ -7,10 +7,15 @@ from .go2_robot_data import PinGo2Model
+ 
+ PHASE_OFFSET = np.array([0.5, 0.0, 0.0, 0.5]).reshape(4)    # trotting gait
+ HEIGHT_SWING = 0.1 # Height of the swing leg trajectory apex
++LEG_ORDER = ("FL", "FR", "RL", "RR")
+ 
+ 
+ class Gait():
+     def __init__(self, frequency_hz, duty):
++        if not np.isfinite(frequency_hz) or frequency_hz <= 0:
++            raise ValueError("gait frequency must be finite and positive")
++        if not np.isfinite(duty) or not 0 <= duty <= 1:
++            raise ValueError("gait duty must be finite and between zero and one")
+         self.gait_duty = duty
+         self.gait_hz = frequency_hz
+ 
+@@ -19,21 +24,33 @@ class Gait():
+         self.swing_time = (1-self.gait_duty) * self.gait_period
+ 
+     def compute_current_mask(self, time):
+-
+-        mask = self.compute_contact_table(time, 0, 1)
+-        return mask
++        """Return the current [FL, FR, RL, RR] contact state as shape ``(4,)``."""
++        return self.compute_contact_table(time, 0.0, 1)[:, 0]
+     
+     def compute_contact_table(self, t0: float, dt: float, N: int) -> np.ndarray:
+-
+-        # times: (N,)
++        """Predict scheduled contacts at ``t0 + k*dt`` in the world-time clock.
++
++        The first column intentionally represents the current control instant.
++        The MPC applies its first force column immediately, so midpoint sampling
++        would let the optimizer anticipate a contact transition before the
++        200 Hz leg controller has made that same transition.
++        """
++        if not np.isfinite(t0) or not np.isfinite(dt):
++            raise ValueError("contact times must be finite")
++        if dt < 0.0:
++            raise ValueError(f"dt must be non-negative, got {dt}")
++        if N <= 0:
++            raise ValueError(f"N must be positive, got {N}")
++
++        # times: (N,), sampled at the beginning of each discrete interval
+         t = t0 + np.arange(N) * dt
+-        t = t + dt/2
+ 
+         # phases: (4,N)
+         phases = np.mod(PHASE_OFFSET[:, None] + t[None, :] / self.gait_period, 1.0)
+ 
+         # mask: (4,N) with 1=stance, 0=swing
+         contact_table = (phases < self.gait_duty).astype(np.int32)
++        assert contact_table.shape == (len(LEG_ORDER), N)
+         return contact_table        
+     
+ 
+@@ -173,5 +190,3 @@ class Gait():
+ 
+         return eval_at
+     
+-
+-
+diff --git a/src/convex_mpc/go2_robot_data.py b/src/convex_mpc/go2_robot_data.py
+index 4bc3642..5032462 100644
+--- a/src/convex_mpc/go2_robot_data.py
++++ b/src/convex_mpc/go2_robot_data.py
+@@ -174,8 +174,12 @@ class PinGo2Model:
+         return getattr(self, name)
+     
+     def compute_com_x_vec(self):
++        """Return ``[p_W, rpy_W, v_W, omega_W]`` as a ``(12, 1)`` column.
+ 
+-        # This function return the 6-DOF 12 states centroidal x-vector
++        Pinocchio stores the free-flyer linear and angular velocity in the body
++        frame. The centroidal MPC uses world-frame velocity and force axes, so
++        angular velocity is rotated into world here as well.
++        """
+         pos_com_world = self.pos_com_world
+         rpy_com_world = self.current_config.compute_euler_angle_world()
+         vel_com_world = self.vel_com_world
+@@ -378,4 +382,3 @@ class PinGo2Model:
+ 
+ 
+ 
+-
+diff --git a/src/convex_mpc/leg_controller.py b/src/convex_mpc/leg_controller.py
+index 353bd03..d1ec0c5 100644
+--- a/src/convex_mpc/leg_controller.py
++++ b/src/convex_mpc/leg_controller.py
+@@ -1,4 +1,5 @@
+ import numpy as np
++from .safety_checks import binary_contacts
+ from .go2_robot_data import PinGo2Model
+ from .gait import Gait
+ from dataclasses import dataclass
+@@ -47,16 +48,26 @@ class LegController():
+         gait: Gait,
+         contact_force: np.ndarray,
+         current_time: float,
++        contact_mask: np.ndarray = None,
+     ):
+         # Extract Parameters
+         leg_idx = LEG_INDEX[leg]
+         joint_slice = JOINT_SLICES[leg]
+ 
+-        J_foot_world = go2.compute_3x3_foot_Jacobian_world(leg)      # (3x3)
+-        J_full_foot_world = go2.compute_full_foot_Jacobian_world(leg)  # (3x18)
+-        g, C, M = go2.compute_dynamcis_terms()
+ 
+-        current_mask = gait.compute_current_mask(current_time)
++        if contact_mask is None:
++            current_mask = gait.compute_current_mask(current_time)
++        else:
++            current_mask = binary_contacts(contact_mask, (4,))
++            if current_mask.shape != (4,):
++                raise ValueError(f"contact_mask must have shape (4,), got {current_mask.shape}")
++        current_mask = binary_contacts(current_mask, (4,))
++        contact_force = np.asarray(contact_force, dtype=float).reshape(-1)
++        if contact_force.shape != (3,) or not np.all(np.isfinite(contact_force)):
++            raise ValueError("contact_force must be a finite world-frame XYZ vector")
++        J_full_foot_world = go2.compute_full_foot_Jacobian_world(leg)
++        g, C, M = go2.compute_dynamcis_terms()
++        J_foot_world = go2.compute_3x3_foot_Jacobian_world(leg)
+         tau_cmd = np.zeros((3, 1))
+ 
+         # Initialize desired to current
+@@ -94,10 +105,13 @@ class LegController():
+             # PD + feedforward in Cartesian space
+             force = KP_SWING @ pos_error + KD_SWING @ vel_error + f_ff  # (3x1)
+ 
+-            # Map to joint torques + add (C*dq + g) leg segment
++            # Map world-frame swing-foot impedance force through J_W.T, then
++            # add the corresponding bias/gravity generalized torques.
+             tau_cmd = J_foot_world.T @ force + (C @ go2.current_config.get_dq() + g)[joint_slice]
+ 
+         else:  # Stance phase
++            # MPC's GRF is the ground force on the robot. The generalized
++            # actuator convention here requires the equal/opposite foot force.
+             tau_cmd = J_foot_world.T @ -contact_force
+ 
+         # Update mask memory
+@@ -109,4 +123,4 @@ class LegController():
+             pos_now=foot_pos_now,
+             vel_des=foot_vel_des,
+             vel_now=foot_vel_now,
+-        )
+\ No newline at end of file
++        )
+diff --git a/src/convex_mpc/safety_checks.py b/src/convex_mpc/safety_checks.py
+new file mode 100644
+index 0000000..cdeb4b0
+--- /dev/null
++++ b/src/convex_mpc/safety_checks.py
+@@ -0,0 +1,32 @@
++"""Input checks, not a hardware safety controller."""
++import numpy as np
++
++
++def binary_contacts(value, shape):
++    """Reject before casting. Invalid contacts never become stance commands."""
++    array = np.asarray(value)
++    if array.shape != shape or not np.all(np.isfinite(array)):
++        raise ValueError(f"contacts must be finite with shape {shape}")
++    if not np.all((array == 0) | (array == 1)):
++        raise ValueError("contacts must contain only binary 0/1 values")
++    return array.astype(bool)
++
++
++def clip_torque(demand, limits):
++    demand, limits = np.asarray(demand), np.asarray(limits)
++    if demand.shape != limits.shape or not np.all(np.isfinite(demand)):
++        raise ValueError("torque demand must be finite and match limits")
++    if not np.all(np.isfinite(limits)) or np.any(limits <= 0):
++        raise ValueError("torque limits must be finite and positive")
++    return np.clip(demand, -limits, limits)
++
++
++def saturation_metrics(demand, clipped):
++    excess = np.abs(np.asarray(demand) - np.asarray(clipped))
++    return {
++        "saturated_joint_samples": int(np.count_nonzero(excess)),
++        "saturated_ticks": int(np.count_nonzero(np.any(excess > 0, axis=-1))),
++        "maximum_clipping_Nm": float(np.max(excess, initial=0)),
++        "per_joint_counts": np.count_nonzero(excess, axis=0).tolist(),
++        "per_joint_maximum_clipping_Nm": np.max(excess, axis=0).tolist(),
++    }
+diff --git a/tests/test_mpc_formulation.py b/tests/test_mpc_formulation.py
+new file mode 100644
+index 0000000..8c68e80
+--- /dev/null
++++ b/tests/test_mpc_formulation.py
+@@ -0,0 +1,130 @@
++import unittest
++
++import numpy as np
++
++from convex_mpc.centroidal_mpc import (
++    MU,
++    NU,
++    NX,
++    RAW_SWING_FORCE_TOL,
++    CentroidalMPC,
++)
++from convex_mpc.com_trajectory import ComTraj
++from convex_mpc.gait import Gait, LEG_ORDER
++from convex_mpc.go2_robot_data import PinGo2Model
++
++
++class _ArrayValue:
++    def __init__(self, value):
++        self._value = np.asarray(value, dtype=float)
++
++    def full(self):
++        return self._value
++
++
++class MPCFormulationTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.go2 = PinGo2Model()
++        cls.gait = Gait(frequency_hz=3.0, duty=0.6)
++        cls.dt = cls.gait.gait_period / 16.0
++        cls.traj = ComTraj(cls.go2)
++        cls.traj.generate_traj(
++            cls.go2,
++            cls.gait,
++            time_now=0.0,
++            x_vel_des_body=0.0,
++            y_vel_des_body=0.0,
++            z_pos_des_body=0.27,
++            yaw_rate_des_body=0.0,
++            time_step=cls.dt,
++        )
++        cls.mpc = CentroidalMPC(cls.go2, cls.traj)
++        cls.solution = cls.mpc.solve_QP(cls.go2, cls.traj)
++        cls.X_opt, cls.U_raw = cls.mpc.extract_solution(
++            cls.solution, cls.traj, cls.gait.compute_current_mask(0.0)
++        )
++
++    def test_dimensions_and_horizon(self):
++        self.assertEqual(self.traj.N, 16)
++        self.assertEqual(self.traj.compute_x_ref_vec().shape, (NX, 16))
++        self.assertEqual(self.traj.contact_table.shape, (len(LEG_ORDER), 16))
++        self.assertEqual(self.traj.Ad.shape, (NX, NX))
++        self.assertEqual(self.traj.Bd.shape, (16, NX, NU))
++        self.assertEqual(self.mpc.H_const.size(), (384, 384))
++        self.assertEqual(self.mpc.A_sp.size(), (448, 384))
++        self.assertEqual(self.X_opt.shape, (NX, 16))
++        self.assertEqual(self.U_raw.shape, (NU, 16))
++
++    def test_contact_table_starts_at_current_control_instant(self):
++        for time_now in (0.0, 0.035, 0.2, 0.335, 1.217):
++            table = self.gait.compute_contact_table(time_now, self.dt, 16)
++            np.testing.assert_array_equal(
++                table[:, 0], self.gait.compute_current_mask(time_now)
++            )
++        np.testing.assert_array_equal(
++            self.gait.compute_current_mask(0.1), np.array([0, 1, 1, 0])
++        )
++
++    def test_world_gravity_has_negative_z_sign(self):
++        self.assertAlmostEqual(float(self.traj.gd[2, 0]), -0.5 * 9.81 * self.dt**2)
++        self.assertAlmostEqual(float(self.traj.gd[8, 0]), -9.81 * self.dt)
++        np.testing.assert_allclose(self.traj.gd[[0, 1, 6, 7]], 0.0)
++
++    def test_contact_force_constraints(self):
++        contact = self.traj.contact_table.astype(bool)
++        force = self.U_raw.reshape(4, 3, self.traj.N)
++        force_by_step = force.transpose(2, 0, 1)
++        self.assertLessEqual(
++            float(np.max(np.abs(force_by_step[~contact.T]))), RAW_SWING_FORCE_TOL
++        )
++
++        stance_fz = force[:, 2, :][contact]
++        self.assertGreaterEqual(float(np.min(stance_fz)), -2e-2)
++        for leg in range(4):
++            for k in range(self.traj.N):
++                if not contact[leg, k]:
++                    continue
++                fx, fy, fz = force[leg, :, k]
++                self.assertLessEqual(abs(fx), MU * fz + 2e-2)
++                self.assertLessEqual(abs(fy), MU * fz + 2e-2)
++
++        current = np.array([0, 1, 1, 0], dtype=np.int32)
++        synthetic_raw = np.arange(1.0, 13.0)
++        applied = self.mpc.apply_contact_mask(synthetic_raw, current)
++        np.testing.assert_array_equal(
++            applied.reshape(4, 3)[~current.astype(bool)], 0.0
++        )
++        np.testing.assert_array_equal(
++            applied.reshape(4, 3)[current.astype(bool)],
++            synthetic_raw.reshape(4, 3)[current.astype(bool)],
++        )
++
++    def test_stance_forces_have_no_invented_upper_bound(self):
++        _, upper = self.mpc._compute_bounds(self.traj)
++        upper = np.asarray(upper, dtype=float).reshape(-1)
++        force_upper = upper[self.traj.N * NX:].reshape(NU, self.traj.N, order="F")
++        contact_xyz = np.repeat(self.traj.contact_table.astype(bool), 3, axis=0)
++        self.assertTrue(np.all(np.isposinf(force_upper[contact_xyz])))
++
++    def test_solver_status_is_exposed(self):
++        self.assertEqual(self.mpc.last_status, "solved")
++        self.assertTrue(self.mpc.last_solver_stats["success"])
++
++    def test_failed_and_nonfinite_solutions_are_rejected(self):
++        checker = CentroidalMPC.__new__(CentroidalMPC)
++        checker.nvars = 2
++        with self.assertRaisesRegex(RuntimeError, "primal infeasible"):
++            checker._validate_solution(
++                {"x": _ArrayValue([[0.0], [0.0]])},
++                {"success": False, "return_status": "primal infeasible"},
++            )
++        with self.assertRaisesRegex(RuntimeError, "invalid decision vector"):
++            checker._validate_solution(
++                {"x": _ArrayValue([[np.nan], [0.0]])},
++                {"success": True, "return_status": "solved"},
++            )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_safety_hardening.py b/tests/test_safety_hardening.py
+new file mode 100644
+index 0000000..a47927d
+--- /dev/null
++++ b/tests/test_safety_hardening.py
+@@ -0,0 +1,79 @@
++import copy
++import unittest
++from unittest.mock import patch
++import casadi as ca
++import numpy as np
++from convex_mpc.safety_checks import binary_contacts, clip_torque, saturation_metrics
++from convex_mpc.centroidal_mpc import CentroidalMPC
++from convex_mpc.leg_controller import LegController
++from convex_mpc.gait import Gait
++import test_mpc_formulation as formulation
++
++
++class SafetyChecksTests(unittest.TestCase):
++    def test_invalid_contacts_fail_closed_without_modifying_input(self):
++        raw = np.ones(12)
++        for bad in (np.nan, np.inf, -np.inf, 2, -1, 0.5):
++            with self.subTest(bad=bad):
++                mask = np.array([bad, 0, 1, 0])
++                with self.assertRaises(ValueError):
++                    CentroidalMPC.apply_contact_mask(raw, mask)
++                with self.assertRaises(ValueError):
++                    binary_contacts(np.full((4, 16), bad), (4, 16))
++                with self.assertRaises(ValueError):
++                    LegController().compute_leg_torque("FL", None, None, np.zeros(3), 0, mask)
++        np.testing.assert_array_equal(raw, np.ones(12))
++        with self.assertRaises(ValueError):
++            binary_contacts(np.ones((4, 1)), (4,))
++
++    def test_bad_gait_time_and_parameters(self):
++        for bad in (np.nan, np.inf):
++            with self.assertRaises(ValueError):
++                Gait(bad, .6)
++            with self.assertRaises(ValueError):
++                Gait(3, bad)
++            with self.assertRaises(ValueError):
++                Gait(3, .6).compute_current_mask(bad)
++
++    def test_clipping_and_saturation_metrics(self):
++        demand = np.array([[2., -3., .5], [0., 0., 0.]])
++        clipped = np.stack([clip_torque(row, np.ones(3)) for row in demand])
++        result = saturation_metrics(demand, clipped)
++        self.assertEqual(result["saturated_joint_samples"], 2)
++        self.assertEqual(result["saturated_ticks"], 1)
++        self.assertEqual(result["maximum_clipping_Nm"], 2)
++        self.assertEqual(result["per_joint_counts"], [1, 1, 0])
++        for bad in (np.nan, np.inf):
++            with self.assertRaises(ValueError):
++                clip_torque([bad], [1])
++
++
++class SolverBoundaryTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        formulation.MPCFormulationTests.setUpClass()
++
++    def test_nonfinite_reference_and_bad_table_rejected(self):
++        fixture = formulation.MPCFormulationTests
++        for bad in (np.nan, np.inf, -np.inf):
++            with patch.object(fixture.traj, "compute_x_ref_vec", return_value=np.full((12, 16), bad)):
++                with self.assertRaisesRegex(ValueError, "reference"):
++                    fixture.mpc.solve_QP(fixture.go2, fixture.traj)
++        traj = copy.copy(fixture.traj)
++        traj.contact_table = np.full((4, 16), .5)
++        with self.assertRaises(ValueError):
++            fixture.mpc.solve_QP(fixture.go2, traj)
++        with self.assertRaises(ValueError):
++            traj._validate_generated_trajectory()
++
++    def test_real_osqp_infeasible_solve_rejected(self):
++        fixture = formulation.MPCFormulationTests
++        mpc = CentroidalMPC(fixture.go2, fixture.traj)
++        # Fix every decision to zero while retaining nonzero initial-state/
++        # gravity equalities. This is a real inconsistent QP, not fake stats.
++        zero = ca.DM.zeros(mpc.nvars, 1)
++        with patch.object(mpc, "_compute_bounds", return_value=(zero, zero)):
++            with self.assertRaisesRegex(RuntimeError, "(?i)(infeasible|maximum iterations reached)"):
++                mpc.solve_QP(fixture.go2, fixture.traj)
++        self.assertIn(mpc.last_status.lower(), ("primal infeasible", "maximum iterations reached"))
++        self.assertFalse(hasattr(mpc, "x_prev"))
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,13 @@
+schema_version: "1.0"
+adapter: grounding_dino
+model_id: IDEA-Research/grounding-dino-tiny
+model_revision: a2bb814dd30d776dcf7e30523b00659f4f141c71
+prompts: [baseball, softball]
+box_threshold: 0.35
+text_threshold: 0.25
+archival_box_threshold: 0.05
+warmup_frames: 3
+batch_size: 1
+device_preference: [mps, cpu]
+local_files_only: false
+
